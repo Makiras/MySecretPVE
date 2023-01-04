@@ -1,0 +1,5 @@
+# Python project gitingore file
+
+__pycache__/
+.vscode/
+config.py
