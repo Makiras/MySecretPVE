@@ -129,7 +129,8 @@ class TencentCDNDomain:
                 "Origin": {
                     "Origins": [ip],
                     "ServerName": domain,
-                    "OriginType": type
+                    "OriginType": type,
+                    "OriginPullProtocol": "follow",
                 }
             }
             req.from_json_string(json.dumps(params))
