@@ -1,7 +1,7 @@
 from proxmoxer import ProxmoxAPI
 from config import *
 from modules.firewall import Firewall
-from modules.tencent import Tencent
+from modules.tencent import Tencent, TencentCDNDomain
 from modules.cloudflare import Cloudflare
 from modules.ipranger import IPRanger
 import ipaddress
@@ -24,5 +24,10 @@ if __name__ == '__main__':
 
     # Update Home IP Alias
     firewall.update_alias('home', ipranger.ip6_net)
+
+    # Update Tencent CDN IP
+    tencent_cdn = TencentCDNDomain(TENCENT_SECRET, TENCENT_KEY)
+    for domain in Tencent_CDN_DOMAINS:
+        tencent_cdn.check_domain(*domain)
 
     
