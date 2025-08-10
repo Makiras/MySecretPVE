@@ -26,17 +26,30 @@ app.secret_key = FLASK_SECRET_KEY
 settings = Settings()
 
 
-def create_proxmox() -> ProxmoxAPI:
-    return ProxmoxAPI(
-        host=settings.pve["host"],
-        user=settings.pve["user"],
-        password=settings.pve["password"],
-        verify_ssl=settings.pve["ssl_verify"],
-    )
+def create_proxmox() -> ProxmoxAPI | None:
+    pve_conf = settings.pve
+    host = (pve_conf.get("host") or "").strip()
+    user = pve_conf.get("user")
+    password = pve_conf.get("password")
+    verify_ssl = bool(pve_conf.get("ssl_verify", True))
+    if not host:
+        return None
+    return ProxmoxAPI(host=host, user=user, password=password, verify_ssl=verify_ssl)
+
+proxmox: ProxmoxAPI | None = None
+firewall: Firewall | None = None
 
 
-proxmox = create_proxmox()
-firewall = Firewall(proxmox)
+def get_firewall() -> Firewall | None:
+    """Create Firewall instance on demand without doing it at app startup."""
+    global proxmox, firewall
+    if firewall is not None:
+        return firewall
+    proxmox = create_proxmox()
+    if proxmox is None:
+        return None
+    firewall = Firewall(proxmox)
+    return firewall
 
 
 def login_required(f):
@@ -71,7 +84,9 @@ def logout():
 @app.route("/")
 @login_required
 def dashboard():
-    return render_template("dashboard.html")
+    # Avoid touching Proxmox on dashboard; only check settings.
+    unconfigured = not bool((settings.pve.get("host") or "").strip())
+    return render_template("dashboard.html", unconfigured=unconfigured)
 
 
 @app.route("/whitelist", methods=["GET", "POST"])
@@ -83,37 +98,47 @@ def whitelist():
         ip = request.form.get("ip", "")
         try:
             network = ip_network(ip, strict=False)
-            ipsets = [i["name"] for i in firewall.get_ipsets()]
-            if ipset_name not in ipsets:
-                firewall.create_ipset(ipset_name, [network])
+            fw = get_firewall()
+            if fw is None:
+                message = "PVE 未配置，请先到设置页面配置。"
             else:
-                current = [ip_network(i) for i in firewall.check_ipset(ipset_name)]
-                current.append(network)
-                firewall.update_ipset(ipset_name, current)
-            message = "IP added successfully"
+                ipsets = [i["name"] for i in fw.get_ipsets()]
+                if ipset_name not in ipsets:
+                    fw.create_ipset(ipset_name, [network])
+                else:
+                    current = [ip_network(i) for i in fw.check_ipset(ipset_name)]
+                    current.append(network)
+                    fw.update_ipset(ipset_name, current)
+                message = "IP added successfully"
         except ValueError:
             message = "Invalid IP address"
-    ipsets = [i["name"] for i in firewall.get_ipsets()]
-    existing_ips = (
-        firewall.check_ipset(ipset_name) if ipset_name in ipsets else []
-    )
+    fw = get_firewall()
+    if fw is None:
+        ipsets = []
+        existing_ips = []
+    else:
+        ipsets = [i["name"] for i in fw.get_ipsets()]
+        existing_ips = fw.check_ipset(ipset_name) if ipset_name in ipsets else []
     return render_template("whitelist.html", ips=existing_ips, message=message)
 
 
 @app.route("/settings/pve", methods=["GET", "POST"])
 @login_required
 def settings_pve():
-    message = None
-    if request.method == "POST":
-        host = request.form.get("host", "")
-        user = request.form.get("user", "")
-        password = request.form.get("password", "")
-        ssl_verify = request.form.get("ssl_verify") == "on"
-        settings.update_pve(host, user, password, ssl_verify)
-        global proxmox, firewall
-        proxmox = create_proxmox()
-        firewall = Firewall(proxmox)
-        message = "PVE settings updated"
+    if request.method == "GET":
+        return render_template("settings_pve.html", settings=settings.pve, message=None)
+
+    # POST
+    host = request.form.get("host", "")
+    user = request.form.get("user", "")
+    password = request.form.get("password", "")
+    ssl_verify = request.form.get("ssl_verify") == "on"
+    settings.update_pve(host, user, password, ssl_verify)
+    # Reset cached clients; will reconnect on demand next time
+    global proxmox, firewall
+    proxmox = None
+    firewall = None
+    message = "PVE settings updated"
     return render_template("settings_pve.html", settings=settings.pve, message=message)
 
 
@@ -131,5 +156,4 @@ def settings_tencent():
     )
 
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+# 入口在 main.py 中统一启动
