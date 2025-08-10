@@ -1,0 +1,32 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="row">
+  <div class="col-md-4 mb-3">
+    <div class="card h-100">
+      <div class="card-body d-flex flex-column">
+        <h5 class="card-title">Firewall Whitelist</h5>
+        <p class="card-text">Manage firewall IP whitelist.</p>
+        <a href="{{ url_for('whitelist') }}" class="mt-auto btn btn-primary">Manage</a>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-4 mb-3">
+    <div class="card h-100">
+      <div class="card-body d-flex flex-column">
+        <h5 class="card-title">PVE Settings</h5>
+        <p class="card-text">Configure Proxmox VE connection parameters.</p>
+        <a href="{{ url_for('settings_pve') }}" class="mt-auto btn btn-primary">Configure</a>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-4 mb-3">
+    <div class="card h-100">
+      <div class="card-body d-flex flex-column">
+        <h5 class="card-title">Tencent Cloud</h5>
+        <p class="card-text">Set Tencent Cloud credentials.</p>
+        <a href="{{ url_for('settings_tencent') }}" class="mt-auto btn btn-primary">Configure</a>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
