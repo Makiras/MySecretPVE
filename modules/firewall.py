@@ -32,15 +32,30 @@ class Firewall:
         res = self.firewall.ipset(ipset).get()
         return [i["cidr"] for i in res] if res else []
 
-    def create_ipset(self, ipset: str, ip_list: List[str] = []) -> None:
+    def create_ipset(self, ipset: str, ip_list: List[str] | None = None) -> None:
+        """Create an IP set.
+
+        Using a mutable list as a default argument can lead to subtle bugs
+        because the list is shared across calls. Use ``None`` and initialize
+        a new list on each invocation instead.
+        """
         self.firewall.ipset.post(ipset=ipset)
+        if ip_list is None:
+            ip_list = []
         for ip in ip_list:
             self.firewall.ipset(ipset).post(cidr=str(ip))
 
     def delete_ipset(self, ipset: str) -> None:
         self.firewall.ipset(ipset).delete()
 
-    def update_ipset(self, ipset: str, ip_list: List[Any] = []) -> None:
+    def update_ipset(self, ipset: str, ip_list: List[Any] | None = None) -> None:
+        """Synchronize the IP set with the provided list.
+
+        Avoids using a mutable default list which would retain values between
+        calls and lead to incorrect firewall rules.
+        """
+        if ip_list is None:
+            ip_list = []
         for ip in self.check_ipset(ipset):
             if ip_network(ip) not in ip_list:
                 self.firewall.ipset(ipset).delete(ip=ip)
