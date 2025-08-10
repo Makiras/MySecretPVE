@@ -17,7 +17,8 @@ class Firewall:
         return res["cidr"] if res else ''
 
     def create_alias(self, alias: str, ip: Any) -> None:
-        self.firewall.aliases.post(alias=alias, cidr=str(ip))
+        # Proxmox API expects 'name' for alias identifier
+        self.firewall.aliases.post(name=alias, cidr=str(ip))
 
     def delete_alias(self, alias: str) -> None:
         self.firewall.aliases(alias).delete()
@@ -32,14 +33,18 @@ class Firewall:
         res = self.firewall.ipset(ipset).get()
         return [i["cidr"] for i in res] if res else []
 
-    def create_ipset(self, ipset: str, ip_list: List[str] | None = None) -> None:
+    def create_ipset(self, ipset: str, ip_list: List[str] | None = None, comment: str | None = None) -> None:
         """Create an IP set.
 
         Using a mutable list as a default argument can lead to subtle bugs
         because the list is shared across calls. Use ``None`` and initialize
         a new list on each invocation instead.
         """
-        self.firewall.ipset.post(ipset=ipset)
+        # Proxmox API expects 'name' for the ipset identifier
+        if comment:
+            self.firewall.ipset.post(name=ipset, comment=comment)
+        else:
+            self.firewall.ipset.post(name=ipset)
         if ip_list is None:
             ip_list = []
         for ip in ip_list:
@@ -58,8 +63,27 @@ class Firewall:
             ip_list = []
         for ip in self.check_ipset(ipset):
             if ip_network(ip) not in ip_list:
-                self.firewall.ipset(ipset).delete(ip=ip)
+                # Use path segment delete: /cluster/firewall/ipset/<name>/<cidr>
+                self.firewall.ipset(ipset)(ip).delete()
             else:
                 ip_list.remove(ip_network(ip))
         for ip in ip_list:
             self.firewall.ipset(ipset).post(cidr=str(ip))
+
+    def add_ip_to_ipset(self, ipset: str, ip: Any) -> None:
+        self.firewall.ipset(ipset).post(cidr=str(ip))
+
+    def remove_ip_from_ipset(self, ipset: str, ip: Any) -> None:
+        # Prefer path-segment deletion to avoid schema param issues
+        self.firewall.ipset(ipset)(str(ip)).delete()
+
+    def set_ipset_comment(self, ipset: str, comment: str | None) -> None:
+        # Some PVE versions expect POST instead of PUT for updating ipset properties
+        self.firewall.ipset.post(name=ipset, rename=ipset, comment=comment)
+
+    def rename_ipset(self, ipset: str, new_name: str) -> None:
+        """Rename an existing IPSet.
+
+        Uses collection POST with name and rename fields for broad compatibility.
+        """
+        self.firewall.ipset.post(name=ipset, rename=new_name)

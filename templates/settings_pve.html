@@ -4,25 +4,234 @@
 {% if message %}
 <div class="alert alert-info">{{ message }}</div>
 {% endif %}
-<form method="post" class="row g-3 col-md-6">
+<form method="post" class="row g-3 col-lg-8" id="pve-form">
   <div class="col-12">
     <label class="form-label" for="host">Host</label>
     <input type="text" class="form-control" id="host" name="host" value="{{ settings.host }}" required>
+  </div>
+  <div class="col-md-4">
+    <label class="form-label" for="protocol">Protocol</label>
+    <input type="text" class="form-control" id="protocol" name="protocol" value="{{ settings.protocol }}" readonly>
+    <div class="form-text">固定为 HTTPS。</div>
+  </div>
+  <div class="col-md-4">
+    <label class="form-label" for="port">Port</label>
+    <input type="number" min="1" max="65535" class="form-control" id="port" name="port" value="{{ settings.port }}">
   </div>
   <div class="col-12">
     <label class="form-label" for="user">User</label>
     <input type="text" class="form-control" id="user" name="user" value="{{ settings.user }}" required>
   </div>
-  <div class="col-12">
-    <label class="form-label" for="password">Password</label>
-    <input type="password" class="form-control" id="password" name="password" value="{{ settings.password }}" required>
+
+  <div class="col-md-6">
+    <label class="form-label" for="auth-mode">认证方式</label>
+    <select id="auth-mode" class="form-select">
+      {% set auth_default = 'token' if settings.token_value else 'password' %}
+      <option value="password" {% if auth_default=='password' %}selected{% endif %}>Password + 可选 OTP</option>
+      <option value="token" {% if auth_default=='token' %}selected{% endif %}>API Token</option>
+    </select>
+  </div>
+
+  <div id="auth-password-group" class="col-12 row g-3 mt-0">
+    <div class="col-md-6">
+      <label class="form-label" for="password">Password</label>
+      <input type="password" class="form-control" id="password" name="password" value="{{ settings.password }}">
+    </div>
+    <div class="col-md-6">
+      <label class="form-label" for="otp">一次性验证码 OTP（仅测试时使用）</label>
+      <input type="text" class="form-control" id="otp" placeholder="例如 123456">
+      <div class="form-text">启用了 TOTP 且未使用 API Token 时，可在“测试配置”时填写。</div>
+    </div>
+  </div>
+
+  <div id="auth-token-group" class="col-12 row g-3 mt-0">
+    <div class="col-md-6">
+      <label class="form-label" for="token_name">API Token ID</label>
+      <input type="text" class="form-control" id="token_name" name="token_name" value="{{ settings.token_name }}" placeholder="例如: myuser@pve!mytoken 或 mytoken">
+      <div class="form-text">可粘贴完整 ID（如 root@pam!mysec），将自动分离到 User 与 TokenID。</div>
+    </div>
+    <div class="col-md-6">
+      <label class="form-label" for="token_value">API Token Secret</label>
+      <input type="password" class="form-control" id="token_value" name="token_value" value="{{ settings.token_value }}" placeholder="复制粘贴生成时的 Secret">
+    </div>
   </div>
   <div class="col-12 form-check">
     <input class="form-check-input" type="checkbox" id="ssl_verify" name="ssl_verify" {% if settings.ssl_verify %}checked{% endif %}>
     <label class="form-check-label" for="ssl_verify">Verify SSL</label>
   </div>
-  <div class="col-12">
-    <button type="submit" class="btn btn-primary">Save</button>
+  <div class="col-12 d-flex gap-2 flex-wrap align-items-center">
+    <button type="submit" class="btn btn-primary">保存</button>
+    <button type="button" id="btn-test-pve" class="btn btn-outline-secondary">测试配置</button>
+    <div id="pve-test-spinner" class="spinner-border spinner-border-sm text-secondary ms-1 d-none" role="status"></div>
   </div>
 </form>
+<div id="pve-test-result" class="mt-3"></div>
+
+<script>
+  (function(){
+    const btn = document.getElementById('btn-test-pve');
+    const result = document.getElementById('pve-test-result');
+    const spinner = document.getElementById('pve-test-spinner');
+    const form = document.getElementById('pve-form');
+    const hostInput = document.getElementById('host');
+    const protoInput = document.getElementById('protocol');
+    const portInput = document.getElementById('port');
+    const otpInput = document.getElementById('otp');
+    const authMode = document.getElementById('auth-mode');
+    const passGroup = document.getElementById('auth-password-group');
+    const tokenGroup = document.getElementById('auth-token-group');
+    const passInput = document.getElementById('password');
+    const tokenIdInput = document.getElementById('token_name');
+    const tokenSecretInput = document.getElementById('token_value');
+
+    function showAlert(ok, msg){
+      result.innerHTML = `
+        <div class="alert ${ok ? 'alert-success' : 'alert-danger'}" role="alert">
+          ${msg}
+        </div>`;
+    }
+
+    function normalizeHostProtocolPort(hostRaw, protoRaw, portRaw){
+      let host = String(hostRaw || '').trim();
+      let protocol = String(protoRaw || 'https').toLowerCase();
+      let port = (portRaw !== undefined && portRaw !== null && String(portRaw).trim() !== '') ? Number(portRaw) : null;
+
+      if (host.startsWith('http://')){ protocol = 'http'; host = host.slice('http://'.length); }
+      else if (host.startsWith('https://')){ protocol = 'https'; host = host.slice('https://'.length); }
+
+      // 去除路径、查询、hash（如 192.168.52.64:8007/# 或 /pve?x=1）
+      const cut = host.search(/[\/\?#]/);
+      if (cut !== -1) host = host.slice(0, cut);
+      host = host.replace(/\/$/, '');
+
+      if (host.startsWith('[')){
+        const idx = host.lastIndexOf(']:');
+        if (idx > -1){
+          const addr = host.slice(0, idx+1);
+          const p = host.slice(idx+2);
+          if (/^\d+$/.test(p)) port = Number(p);
+          host = addr;
+        }
+      } else {
+        const parts = host.split(':');
+        if (parts.length === 2 && /^\d+$/.test(parts[1])){
+          host = parts[0];
+          port = Number(parts[1]);
+        }
+      }
+
+      if (port == null || Number.isNaN(port)) port = 8006;
+      return { host, protocol, port };
+    }
+
+    function switchAuthUI(mode){
+      const isToken = mode === 'token';
+      passGroup.style.display = isToken ? 'none' : '';
+      tokenGroup.style.display = isToken ? '' : 'none';
+      // 切换 required/disabled，避免提交无关字段
+      passInput.required = !isToken;
+      passInput.disabled = isToken;
+      tokenIdInput.required = isToken;
+      tokenIdInput.disabled = !isToken;
+      tokenSecretInput.required = isToken;
+      tokenSecretInput.disabled = !isToken;
+    }
+
+    // TokenID 自动格式化：root@pam!mysec -> user=root@pam, token_name=mysec
+    function autoFormatTokenId(value){
+      if (!value || typeof value !== 'string') return;
+      const idx = value.indexOf('!');
+      if (idx > 0){
+        const left = value.slice(0, idx);
+        const right = value.slice(idx+1);
+        if (/@/.test(left) && user) {
+          user.value = left;
+        }
+        tokenIdInput.value = right || '';
+      }
+    }
+
+    form?.addEventListener('submit', (e) => {
+      // 在提交前进行归一化并写回到表单字段
+      const norm = normalizeHostProtocolPort(hostInput?.value, protoInput?.value, portInput?.value);
+      if (hostInput) hostInput.value = norm.host;
+      if (protoInput) protoInput.value = norm.protocol; // 只读，仍写入以确保被提交
+      if (portInput) portInput.value = String(norm.port);
+      // 根据选择隐藏无关字段
+      switchAuthUI(authMode.value);
+    });
+
+    // 立即归一化：粘贴或失焦时
+    hostInput?.addEventListener('paste', (e) => {
+      const text = e.clipboardData?.getData('text') || '';
+      if (text) {
+        e.preventDefault();
+        const norm = normalizeHostProtocolPort(text, protoInput?.value, portInput?.value);
+        hostInput.value = norm.host;
+        protoInput.value = norm.protocol;
+        portInput.value = String(norm.port);
+      }
+    });
+    hostInput?.addEventListener('blur', () => {
+      const norm = normalizeHostProtocolPort(hostInput.value, protoInput?.value, portInput?.value);
+      hostInput.value = norm.host;
+      protoInput.value = norm.protocol;
+      portInput.value = String(norm.port);
+    });
+
+    // 切换认证方式
+    authMode?.addEventListener('change', () => switchAuthUI(authMode.value));
+    // 初始渲染
+    switchAuthUI(authMode?.value || 'password');
+
+    // TokenID 粘贴与输入联动
+    tokenIdInput?.addEventListener('paste', (e) => {
+      const text = e.clipboardData?.getData('text') || '';
+      if (text.includes('!')){
+        e.preventDefault();
+        tokenIdInput.value = text;
+        autoFormatTokenId(text);
+      }
+    });
+    tokenIdInput?.addEventListener('blur', () => autoFormatTokenId(tokenIdInput.value));
+
+    btn?.addEventListener('click', async () => {
+      // 使用表单当前值进行测试（先做前端归一化）
+      const norm = normalizeHostProtocolPort(hostInput?.value, protoInput?.value, portInput?.value);
+      if (hostInput) hostInput.value = norm.host; // 同步回显
+      if (portInput) portInput.value = String(norm.port);
+
+      const fd = new FormData(form);
+      const mode = authMode.value;
+      const payload = {
+        host: norm.host,
+        user: fd.get('user'),
+        ssl_verify: fd.get('ssl_verify') === 'on',
+        protocol: norm.protocol,
+        port: norm.port,
+      };
+      if (mode === 'token'){
+        payload.token_name = tokenIdInput.value || '';
+        payload.token_value = tokenSecretInput.value || '';
+      } else {
+        payload.password = fd.get('password');
+        payload.otp = otpInput?.value || '';
+      }
+      btn.disabled = true; spinner.classList.remove('d-none'); result.innerHTML = '';
+      try {
+        const res = await fetch(`${window.location.origin}/api/test/pve`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        showAlert(!!data.ok, data.message || (data.ok ? '连接成功' : '连接失败'));
+      } catch (e) {
+        showAlert(false, '请求失败，请检查网络或服务端日志');
+      } finally {
+        btn.disabled = false; spinner.classList.add('d-none');
+      }
+    });
+  })();
+  </script>
 {% endblock %}

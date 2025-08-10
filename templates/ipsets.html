@@ -1,0 +1,81 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="row align-items-center g-2 mb-3">
+  <div class="col-12 col-lg-4">
+    <h2 class="mb-0">Firewall IP Sets</h2>
+  </div>
+  <div class="col-12 col-lg-8">
+    <form method="post" class="row g-2 align-items-center" id="create-ipset-form">
+      <input type="hidden" name="action" value="create">
+      <div class="col-12 col-sm-4">
+        <input type="text" name="name" class="form-control" placeholder="新建 IPSet 名称（仅 ASCII）" id="create-name" required>
+        <div class="invalid-feedback">名称仅允许 ASCII 字符。</div>
+      </div>
+      <div class="col-12 col-sm">
+        <input type="text" name="comment" class="form-control" placeholder="备注（可选，仅 ASCII）" id="create-comment">
+        <div class="invalid-feedback">备注不允许包含中文或非 ASCII 字符。</div>
+      </div>
+      <div class="col-12 col-sm-auto text-end">
+        <button type="submit" class="btn btn-primary w-100 w-sm-auto">新建</button>
+      </div>
+    </form>
+  </div>
+  </div>
+
+{% if message %}
+<div class="alert alert-info">{{ message }}</div>
+{% endif %}
+
+<div class="card">
+  <div class="card-body p-0 table-responsive">
+    <table class="table table-hover mb-0 align-middle">
+      <thead>
+        <tr>
+          <th style="width: 40%">名称</th>
+          <th>备注</th>
+          <th style="width: 20%" class="text-end text-nowrap">操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in ipsets %}
+        <tr>
+          <td><a href="{{ url_for('ipsets_detail', name=s.name) }}" class="text-decoration-none">{{ s.name }}</a></td>
+          <td>{{ s.comment or '' }}</td>
+          <td class="text-end text-nowrap">
+            <a href="{{ url_for('ipsets_detail', name=s.name) }}" class="btn btn-sm btn-outline-primary">管理 CIDR</a>
+            <form method="post" style="display:inline" onsubmit="return confirm('确定删除该 IPSet 及其所有条目？');">
+              <input type="hidden" name="action" value="delete">
+              <input type="hidden" name="name" value="{{ s.name }}">
+              <button type="submit" class="btn btn-sm btn-outline-danger">删除</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  (function(){
+    const form = document.getElementById('create-ipset-form');
+    const comment = document.getElementById('create-comment');
+    const nameInput = document.getElementById('create-name');
+    function hasNonASCII(s){ return /[^\x00-\x7F]/.test(s || ''); }
+    function validate(){
+      const badComment = hasNonASCII(comment.value);
+      const badName = hasNonASCII(nameInput.value);
+      comment.classList.toggle('is-invalid', badComment);
+      nameInput.classList.toggle('is-invalid', badName);
+      return !(badComment || badName);
+    }
+    comment?.addEventListener('input', validate);
+    comment?.addEventListener('paste', () => setTimeout(validate));
+    nameInput?.addEventListener('input', validate);
+    nameInput?.addEventListener('paste', () => setTimeout(validate));
+    form?.addEventListener('submit', (e) => { if (!validate()) { e.preventDefault(); e.stopPropagation(); } });
+  })();
+  </script>
+{% endblock %}

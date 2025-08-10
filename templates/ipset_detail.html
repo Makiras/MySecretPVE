@@ -1,0 +1,156 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="row g-3 align-items-start mb-2">
+  <div class="col-12 col-lg-6">
+    <h2 class="mb-1">IPSet: {{ name }}</h2>
+    <form method="post" class="row g-2 align-items-center" id="update-comment-form">
+      <input type="hidden" name="action" value="update_comment">
+      <div class="col-auto">
+        <label class="form-label mb-0" for="comment">备注</label>
+      </div>
+      <div class="col">
+        <input type="text" class="form-control" id="comment" name="comment" value="{{ comment }}" placeholder="该 IPSet 的说明（仅 ASCII）">
+        <div class="invalid-feedback">备注不允许包含中文或非 ASCII 字符。</div>
+      </div>
+      <div class="col-auto">
+        <button type="submit" class="btn btn-outline-secondary">保存备注</button>
+      </div>
+    </form>
+  </div>
+  <div class="col-12 col-lg-6">
+    <div class="row g-2">
+      <div class="col-12">
+        <form method="post" class="input-group">
+          <input type="hidden" name="action" value="add">
+          <input type="text" name="ip" class="form-control" placeholder="例如: 1.2.3.4 或 10.0.0.0/8" required>
+          <button type="submit" class="btn btn-success">添加</button>
+        </form>
+      </div>
+      <div class="col-12">
+        <form method="post" class="input-group" id="rename-form">
+          <input type="hidden" name="action" value="rename">
+          <span class="input-group-text">重命名为</span>
+          <div class="form-floating flex-grow-1">
+            <input type="text" class="form-control" name="new_name" id="new_name" value="{{ name }}" placeholder="新名称（仅 ASCII）" required>
+            <label for="new_name">新名称（仅 ASCII）</label>
+            <div class="invalid-feedback">名称仅允许 ASCII 字符。</div>
+          </div>
+          <button type="submit" class="btn btn-outline-secondary">重命名</button>
+        </form>
+      </div>
+      <div class="col-12 d-flex gap-2 flex-wrap">
+        <a class="btn btn-outline-primary" href="{{ url_for('ipsets_export', name=name) }}">导出</a>
+        <form method="post" onsubmit="return confirm('确定删除该 IPSet 及其所有条目？');">
+          <input type="hidden" name="action" value="delete_ipset">
+          <button type="submit" class="btn btn-outline-danger">删除此 IPSet</button>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% if message %}
+<div class="alert alert-info">{{ message }}</div>
+{% endif %}
+
+<div class="card mb-3">
+  <div class="card-header">批量导入</div>
+  <div class="card-body">
+    <form method="post" class="row g-3">
+      <input type="hidden" name="action" value="bulk_import">
+      <div class="col-12">
+        <textarea name="content" class="form-control" rows="4" placeholder="每行一个或用逗号、空格分隔的 IP/CIDR"></textarea>
+      </div>
+      <div class="col-md-3">
+        <select class="form-select" name="mode">
+          <option value="append" selected>追加</option>
+          <option value="replace">替换</option>
+        </select>
+      </div>
+      <div class="col-md-3">
+        <button type="submit" class="btn btn-primary">导入</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="d-flex gap-2 align-items-start mb-2">
+  <form method="get" class="flex-grow-1" id="search-form">
+    <div class="input-group">
+      <input type="text" class="form-control" name="q" id="search-input" value="{{ q or '' }}" placeholder="搜索 CIDR，如 10. 或 :/64">
+      <button class="btn btn-outline-secondary" type="submit">搜索</button>
+    </div>
+  </form>
+  <form method="post" id="bulk-remove-form" onsubmit="return confirm('确定删除当前筛选结果吗？此操作不可撤销。');">
+    <input type="hidden" name="action" value="bulk_remove">
+    <input type="hidden" name="q" id="bulk-remove-q" value="{{ q or '' }}">
+    <button type="submit" class="btn btn-outline-danger">删除筛选结果</button>
+  </form>
+</div>
+
+<div class="card">
+  <div class="card-body p-0 table-responsive">
+    <table class="table table-striped mb-0 align-middle">
+      <thead>
+        <tr>
+          <th>CIDR</th>
+          <th style="width: 20%" class="text-end text-nowrap">操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for ip in ips %}
+        <tr>
+          <td>{{ ip }}</td>
+          <td class="text-end text-nowrap">
+            <form method="post" style="display:inline" onsubmit="return confirm('确定移除此条目？');">
+              <input type="hidden" name="action" value="remove">
+              <input type="hidden" name="ip" value="{{ ip }}">
+              <button type="submit" class="btn btn-sm btn-outline-danger">移除</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+  (function(){
+    const form = document.getElementById('update-comment-form');
+    const comment = document.getElementById('comment');
+    const renameForm = document.getElementById('rename-form');
+    const newName = document.getElementById('new_name');
+    function hasNonASCII(s){ return /[^\x00-\x7F]/.test(s || ''); }
+    function validate(){
+      const bad = hasNonASCII(comment.value);
+      comment.classList.toggle('is-invalid', bad);
+      return !bad;
+    }
+    comment?.addEventListener('input', validate);
+    comment?.addEventListener('paste', () => setTimeout(validate));
+    form?.addEventListener('submit', (e) => { if (!validate()) { e.preventDefault(); e.stopPropagation(); } });
+
+    // Rename: block non-ASCII in name as well
+    function validateName(){
+      const bad = hasNonASCII(newName.value);
+      newName.classList.toggle('is-invalid', bad);
+      return !bad;
+    }
+    newName?.addEventListener('input', validateName);
+    newName?.addEventListener('paste', () => setTimeout(validateName));
+    renameForm?.addEventListener('submit', (e) => { if (!validateName()) { e.preventDefault(); e.stopPropagation(); } });
+
+    // Keep bulk-remove q in sync with search input
+    const searchInput = document.getElementById('search-input');
+    const bulkQ = document.getElementById('bulk-remove-q');
+    function syncQ(){ if (bulkQ && searchInput) bulkQ.value = searchInput.value || ''; }
+    searchInput?.addEventListener('input', syncQ);
+    searchInput?.addEventListener('change', syncQ);
+    syncQ();
+  })();
+  </script>
+{% endblock %}
