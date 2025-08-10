@@ -2,3 +2,5 @@ proxmoxer
 requests
 dnspython
 tencentcloud-sdk-python
+Flask
+SQLAlchemy

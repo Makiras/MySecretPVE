@@ -12,3 +12,9 @@ TENCENT_KEY = ''
 Tencent_CDN_DOMAINS = [
     # (CDN Domain, DNS Domain, Dommain Type ),
 ]
+
+# Web Configuration
+WEB_USERNAME = 'admin'
+WEB_PASSWORD = 'password'
+FLASK_SECRET_KEY = 'change-me'
+
