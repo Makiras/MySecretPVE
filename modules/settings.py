@@ -1,4 +1,7 @@
+from __future__ import annotations
 from sqlalchemy import create_engine, Column, String, Boolean, Integer, text
+from sqlalchemy.types import BigInteger
+from datetime import datetime
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 # 初始化数据库
@@ -48,6 +51,11 @@ class Settings:
                 conn.exec_driver_sql("ALTER TABLE pve_config ADD COLUMN token_name VARCHAR")
             if "token_value" not in cols:
                 conn.exec_driver_sql("ALTER TABLE pve_config ADD COLUMN token_value VARCHAR")
+            # ensure temp_whitelist table and new columns
+            conn.exec_driver_sql("CREATE TABLE IF NOT EXISTS temp_whitelist (id INTEGER PRIMARY KEY AUTOINCREMENT, cidr VARCHAR NOT NULL, created_at BIGINT NOT NULL, expires_at BIGINT NOT NULL)")
+            cols_tw = {r[1] for r in conn.exec_driver_sql("PRAGMA table_info('temp_whitelist')").fetchall()}
+            if "hostname" not in cols_tw:
+                conn.exec_driver_sql("ALTER TABLE temp_whitelist ADD COLUMN hostname VARCHAR")
         self.db = SessionLocal()
 
     # 归一化 PVE Host：剥离协议与端口，自动识别重复输入
@@ -140,6 +148,61 @@ class Settings:
             config.port = norm_port
             config.token_name = (token_name or None)
             config.token_value = (token_value or None)
+        self.db.commit()
+
+    # 临时白名单表：记录 CIDR 与过期时间
+    class TempWhitelist(Base):
+        __tablename__ = "temp_whitelist"
+
+        id = Column(Integer, primary_key=True, autoincrement=True)
+        cidr = Column(String, nullable=False, index=True)
+        created_at = Column(BigInteger, nullable=False)  # epoch seconds
+        expires_at = Column(BigInteger, nullable=False)  # epoch seconds
+        hostname = Column(String, nullable=True)
+
+    def _ensure_tempwhitelist_table(self):
+        # Create table if not exists (create_all covers new tables)
+        self.db.execute(text(""))  # no-op to ensure engine is ready
+
+    def add_or_update_temp_whitelist(self, cidr: str, expires_at: int, hostname: str | None = None) -> None:
+        now = int(datetime.utcnow().timestamp())
+        row = self.db.query(Settings.TempWhitelist).filter_by(cidr=cidr).first()
+        if row:
+            row.expires_at = expires_at
+            if hostname:
+                row.hostname = hostname
+        else:
+            row = Settings.TempWhitelist(cidr=cidr, created_at=now, expires_at=expires_at, hostname=(hostname or None))
+            self.db.add(row)
+        self.db.commit()
+
+    def get_expired_temp_whitelist(self, now_ts: int) -> list["Settings.TempWhitelist"]:
+        return (
+            self.db.query(Settings.TempWhitelist)
+            .filter(Settings.TempWhitelist.expires_at <= now_ts)
+            .all()
+        )
+
+    def delete_temp_whitelist(self, cidr: str) -> None:
+        self.db.query(Settings.TempWhitelist).filter_by(cidr=cidr).delete()
+        self.db.commit()
+
+    def list_temp_whitelist(self, include_expired: bool = False) -> list["Settings.TempWhitelist"]:
+        q = self.db.query(Settings.TempWhitelist)
+        if not include_expired:
+            now_ts = int(datetime.utcnow().timestamp())
+            q = q.filter(Settings.TempWhitelist.expires_at > now_ts)
+        return q.order_by(Settings.TempWhitelist.expires_at.asc()).all()
+
+    def update_temp_hostname(self, cidr: str, hostname: str | None) -> None:
+        row = self.db.query(Settings.TempWhitelist).filter_by(cidr=cidr).first()
+        if not row:
+            # create a placeholder with immediate expiration in case not exists
+            now = int(datetime.utcnow().timestamp())
+            row = Settings.TempWhitelist(cidr=cidr, created_at=now, expires_at=now, hostname=(hostname or None))
+            self.db.add(row)
+        else:
+            row.hostname = (hostname or None)
         self.db.commit()
 
     @property

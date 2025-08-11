@@ -1,0 +1,401 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="row">
+  <div class="col-md-8">
+    <div class="card mb-3">
+      <div class="card-body">
+        <div class="d-flex align-items-center justify-content-between">
+          <h5 class="card-title mb-0">Temporary Whitelist</h5>
+          <div>
+            <button id="refreshBtn" class="btn btn-sm btn-outline-secondary">Refresh</button>
+          </div>
+        </div>
+        <p class="card-text">This page will detect your public IP in the browser and add it to the <code>temp</code> IPSet with a selected TTL. Expiration is processed hourly.</p>
+
+        <div class="row g-3 mb-2">
+          <div class="col-md-6">
+            <label class="form-label">Detected IPv4</label>
+            <input id="ip4" class="form-control" readonly placeholder="Detecting..." />
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">Detected IPv6</label>
+            <input id="ip6" class="form-control" readonly placeholder="Detecting..." />
+          </div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">Hostname (optional)</label>
+          <input id="hostname" class="form-control" placeholder="e.g. alice-laptop" />
+        </div>
+
+        <div class="mb-3">
+          <label class="form-label">Duration</label>
+          <div>
+            <div class="form-check form-check-inline">
+              <input class="form-check-input" type="radio" name="ttlDays" id="ttl1" value="1" checked>
+              <label class="form-check-label" for="ttl1">1 day</label>
+            </div>
+            <div class="form-check form-check-inline">
+              <input class="form-check-input" type="radio" name="ttlDays" id="ttl7" value="7">
+              <label class="form-check-label" for="ttl7">7 days</label>
+            </div>
+            <div class="form-check form-check-inline">
+              <input class="form-check-input" type="radio" name="ttlDays" id="ttl14" value="14">
+              <label class="form-check-label" for="ttl14">14 days</label>
+            </div>
+          </div>
+          <div class="form-check mt-2">
+            <input class="form-check-input" type="checkbox" id="autoAddToggle">
+            <label class="form-check-label" for="autoAddToggle">Auto add on page load (remember)</label>
+          </div>
+          <div class="form-text" id="autoAddStatus">Auto add: loading…</div>
+        </div>
+
+        <div class="d-flex gap-2">
+          <button id="addBtn" class="btn btn-primary" disabled>Add detected IPs</button>
+          <button id="retryBtn" class="btn btn-outline-secondary">Retry Detect</button>
+        </div>
+
+        <div class="mt-3">
+          <div id="msg" class="alert d-none" role="alert"></div>
+        </div>
+
+        <small class="text-muted">Note: The page detects IPv4 and IPv6 independently; either may be unavailable depending on your network.</small>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-12">
+    <div class="card">
+      <div class="card-body">
+        <h5 class="card-title">Active Temporary Entries</h5>
+        <div class="table-responsive">
+          <table class="table table-sm">
+            <thead>
+              <tr>
+                <th scope="col">CIDR</th>
+                <th scope="col">Hostname</th>
+                <th scope="col">Expires (UTC)</th>
+                <th scope="col">Remaining</th>
+                <th scope="col">Present</th>
+                <th scope="col" style="width: 240px;">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="listBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  const ip4Input = document.getElementById('ip4');
+  const ip6Input = document.getElementById('ip6');
+  const addBtn = document.getElementById('addBtn');
+  const retryBtn = document.getElementById('retryBtn');
+  const msg = document.getElementById('msg');
+  const hostnameInput = document.getElementById('hostname');
+  const listBody = document.getElementById('listBody');
+  const refreshBtn = document.getElementById('refreshBtn');
+  const autoAddToggle = document.getElementById('autoAddToggle');
+  const autoAddStatus = document.getElementById('autoAddStatus');
+  let serverNow = 0; // seconds, from server
+  let timers = [];
+  let autoRefreshTimer = null;
+
+  function isIPv4(s) {
+    const re = /^(25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)){3}$/;
+    return re.test(s);
+  }
+  function isIPv6(s) {
+    // Require ':' and reject pure IPv4; allow compressed IPv6
+    return s.includes(':') && !s.includes('.') && s.length <= 39;
+  }
+
+  async function detectIPv4() {
+    ip4Input.value = 'Detecting...';
+    const endpoints = [
+      'https://api.ipify.org?format=json',
+      'https://4.ipw.cn'
+    ];
+    for (const url of endpoints) {
+      try {
+        const r = await fetch(url, {cache: 'no-store'});
+        if (!r.ok) continue;
+        if (url.includes('ipify')) {
+          const j = await r.json();
+          if (j.ip && isIPv4(j.ip)) { ip4Input.value = j.ip; return j.ip; }
+        } else {
+          const t = (await r.text()).trim();
+          if (t && isIPv4(t)) { ip4Input.value = t; return t; }
+        }
+      } catch (_) { /* ignore */ }
+    }
+    ip4Input.value = 'Unreachable';
+    return '';
+  }
+
+  async function detectIPv6() {
+    ip6Input.value = 'Detecting...';
+    const endpoints = [
+      'https://api64.ipify.org?format=json',
+      'https://6.ipw.cn'
+    ];
+    for (const url of endpoints) {
+      try {
+        const r = await fetch(url, {cache: 'no-store'});
+        if (!r.ok) continue;
+        if (url.includes('ipify')) {
+          const j = await r.json();
+          if (j.ip && isIPv6(j.ip)) { ip6Input.value = j.ip; return j.ip; }
+        } else {
+          const t = (await r.text()).trim();
+          if (t && isIPv6(t)) { ip6Input.value = t; return t; }
+        }
+      } catch (_) { /* ignore */ }
+    }
+    ip6Input.value = 'Unreachable';
+    return '';
+  }
+
+  function ttlDays() {
+    const el = document.querySelector('input[name="ttlDays"]:checked');
+    return el ? parseInt(el.value, 10) : 1;
+  }
+
+  function loadPrefs() {
+    try {
+      const autoAdd = localStorage.getItem('tempwl_auto_add');
+      if (autoAdd === '1') autoAddToggle.checked = true;
+      const ttl = localStorage.getItem('tempwl_ttl');
+      if (ttl && ['1','7','14'].includes(ttl)) {
+        const r = document.getElementById('ttl' + ttl);
+        if (r) r.checked = true;
+      }
+    } catch (_) {}
+  }
+
+  function savePrefs() {
+    try {
+      localStorage.setItem('tempwl_auto_add', autoAddToggle.checked ? '1' : '0');
+      localStorage.setItem('tempwl_ttl', String(ttlDays()))
+    } catch (_) {}
+    updateAutoStatus();
+  }
+
+  function updateAutoStatus() {
+    try {
+      const on = autoAddToggle.checked;
+      const lastTs = parseInt(localStorage.getItem('tempwl_last_auto_add') || '0', 10);
+      let lastText = 'never';
+      if (!isNaN(lastTs) && lastTs > 0) {
+        lastText = new Date(lastTs * 1000).toLocaleString();
+      }
+      autoAddStatus.textContent = `Auto add: ${on ? 'ON' : 'OFF'} | Last auto-add: ${lastText}`;
+    } catch (_) {
+      autoAddStatus.textContent = 'Auto add: (status unavailable)';
+    }
+  }
+
+  async function addTempMany(ips) {
+    msg.classList.add('d-none');
+    addBtn.disabled = true;
+    let okAny = false;
+    let parts = [];
+    for (const ip of ips) {
+      if (!ip) continue;
+      try {
+        const r = await fetch('/api/temp_whitelist', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ip, ttl_days: ttlDays(), hostname: hostnameInput.value.trim() || undefined})
+        });
+        const j = await r.json();
+        if (j && j.ok) {
+          okAny = true;
+          parts.push(`Added ${j.cidr} (expires ${j.expires_at})`);
+        } else if (j && j.message) {
+          parts.push(`Failed ${ip}: ${j.message}`);
+        } else {
+          parts.push(`Failed ${ip}`);
+        }
+      } catch (e) {
+        parts.push(`Request failed for ${ip}`);
+      }
+    }
+    msg.classList.remove('d-none');
+    msg.classList.toggle('alert-success', okAny);
+    msg.classList.toggle('alert-danger', !okAny);
+    msg.textContent = parts.length ? parts.join(' | ') : 'No IP detected';
+    addBtn.disabled = false;
+    await loadList();
+  }
+
+  async function extendOne(cidr, days) {
+    try {
+      const r = await fetch('/api/temp_whitelist/extend', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({cidr, ttl_days: days})
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.message || 'extend failed');
+    } catch (e) {
+      console.error(e);
+    } finally {
+      await loadList();
+    }
+  }
+
+  async function deleteOne(cidr) {
+    try {
+      const r = await fetch('/api/temp_whitelist', {
+        method: 'DELETE',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({cidr})
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.message || 'delete failed');
+    } catch (e) {
+      console.error(e);
+    } finally {
+      await loadList();
+    }
+  }
+
+  // Events
+  addBtn.addEventListener('click', async () => {
+    await addTempMany([ip4Input.value.trim(), ip6Input.value.trim()].map(v => (v.includes(':')||v.includes('.') ? v : '')));
+  });
+  retryBtn.addEventListener('click', async () => {
+    const [v4, v6] = await Promise.all([detectIPv4(), detectIPv6()]);
+    addBtn.disabled = !(v4 || v6);
+  });
+  refreshBtn.addEventListener('click', async () => {
+    await loadList();
+  });
+  autoAddToggle.addEventListener('change', savePrefs);
+  document.querySelectorAll('input[name="ttlDays"]').forEach(el => el.addEventListener('change', savePrefs));
+
+  // Auto-run on load: detect and add once with default TTL
+  function fmtRemaining(sec) {
+    if (sec <= 0) return 'expired';
+    const d = Math.floor(sec / 86400);
+    sec %= 86400;
+    const h = Math.floor(sec / 3600);
+    sec %= 3600;
+    const m = Math.floor(sec / 60);
+    const s = Math.floor(sec % 60);
+    const parts = [];
+    if (d) parts.push(`${d}d`);
+    parts.push(`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`);
+    return parts.join(' ');
+  }
+
+  async function loadList() {
+    listBody.innerHTML = '<tr><td colspan="4">Loading...</td></tr>';
+    timers.forEach(t => clearInterval(t));
+    timers = [];
+    try {
+      const r = await fetch('/api/temp_whitelist');
+      const j = await r.json();
+      if (!j.ok) throw new Error('fetch failed');
+      const rows = j.items || [];
+      serverNow = j.now || Math.floor(Date.now() / 1000);
+      listBody.innerHTML = '';
+      for (const it of rows) {
+        const tr = document.createElement('tr');
+        const expSec = it.expires_at || 0;
+        const exp = new Date(expSec * 1000).toISOString();
+        const rowId = `row_${btoa(it.cidr).replace(/=/g,'')}`;
+        tr.innerHTML = `
+          <td><code>${it.cidr}</code></td>
+          <td>
+            <div class="input-group input-group-sm" style="max-width: 320px;">
+              <input class="form-control" data-field="hostname" data-cidr="${it.cidr}" value="${it.hostname ? it.hostname : ''}" placeholder="hostname" />
+              <button class="btn btn-outline-primary" data-act="save-hostname" data-cidr="${it.cidr}">Save</button>
+            </div>
+          </td>
+          <td>${exp}</td>
+          <td id="${rowId}"></td>
+          <td>${it.present ? 'Yes' : 'No'}</td>
+          <td>
+            <div class="btn-group btn-group-sm" role="group">
+              <button class="btn btn-outline-secondary" data-act="extend" data-days="1" data-cidr="${it.cidr}">+1d</button>
+              <button class="btn btn-outline-secondary" data-act="extend" data-days="7" data-cidr="${it.cidr}">+7d</button>
+              <button class="btn btn-outline-secondary" data-act="extend" data-days="14" data-cidr="${it.cidr}">+14d</button>
+              <button class="btn btn-outline-danger" data-act="delete" data-cidr="${it.cidr}">Delete</button>
+            </div>
+          </td>
+        `;
+        listBody.appendChild(tr);
+
+        // start per-row remaining countdown using serverNow baseline
+        let base = serverNow;
+        const update = () => {
+          const now = base + Math.floor((Date.now() / 1000) - (Date.now() / 1000 - 0)); // adjusted below
+          const rem = expSec - (Math.floor(Date.now() / 1000) - 0 + (serverNow ? 0 : 0));
+        };
+        const el = document.getElementById(rowId);
+        const tick = () => {
+          const nowClient = Math.floor(Date.now() / 1000);
+          const offset = nowClient - serverNow; // client - server
+          const rem = expSec - (serverNow + offset);
+          el.textContent = fmtRemaining(rem);
+        };
+        tick();
+        timers.push(setInterval(tick, 1000));
+      }
+      if (!rows.length) {
+        listBody.innerHTML = '<tr><td colspan="4">No active entries</td></tr>';
+      }
+      // delegate actions
+      listBody.querySelectorAll('button[data-act]')
+        .forEach(btn => btn.addEventListener('click', async (ev) => {
+          const b = ev.currentTarget;
+          const act = b.getAttribute('data-act');
+          const cidr = b.getAttribute('data-cidr');
+          if (act === 'extend') {
+            const days = parseInt(b.getAttribute('data-days') || '1', 10);
+            await extendOne(cidr, days);
+          } else if (act === 'delete') {
+            await deleteOne(cidr);
+          } else if (act === 'save-hostname') {
+            const input = b.parentElement.querySelector('input[data-field="hostname"]');
+            const name = input ? input.value.trim() : '';
+            try {
+              const r = await fetch('/api/temp_whitelist/hostname', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({cidr, hostname: name || undefined})
+              });
+              const j = await r.json();
+              if (!j.ok) throw new Error(j.message || 'save failed');
+            } catch (e) {
+              console.error(e);
+            }
+          }
+        }));
+    } catch (e) {
+      listBody.innerHTML = '<tr><td colspan="4">Failed to load</td></tr>';
+    }
+  }
+
+  (async () => {
+    loadPrefs();
+    updateAutoStatus();
+    const [v4, v6] = await Promise.all([detectIPv4(), detectIPv6()]);
+    addBtn.disabled = !(v4 || v6);
+    // Conditionally auto add based on user preference
+    if (autoAddToggle.checked && (v4 || v6)) {
+      await addTempMany([v4, v6]);
+      try { localStorage.setItem('tempwl_last_auto_add', String(Math.floor(Date.now()/1000))); } catch (_) {}
+      updateAutoStatus();
+    }
+    await loadList();
+    if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+    autoRefreshTimer = setInterval(loadList, 30000);
+  })();
+</script>
+{% endblock %}

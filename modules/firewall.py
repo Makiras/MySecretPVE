@@ -1,3 +1,4 @@
+from __future__ import annotations
 from proxmoxer import ProxmoxAPI, ProxmoxResource
 from typing import List, Dict, Any
 from ipaddress import IPv4Network, IPv6Network, ip_network

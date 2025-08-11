@@ -1,3 +1,4 @@
+from __future__ import annotations
 from functools import wraps
 import logging
 import http.client as http_client
@@ -24,12 +25,17 @@ from config import (
 )
 from modules.firewall import Firewall
 from modules.settings import Settings
+from datetime import datetime, timedelta
+import threading
+import time
 
 
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET_KEY
 
 settings = Settings()
+_cleanup_thread_started = False
+_cleanup_lock = threading.Lock()
 
 def setup_request_logging():
     """Enable verbose logging for proxmoxer and HTTP requests.
@@ -141,6 +147,55 @@ def get_firewall() -> Firewall | None:
     return firewall
 
 
+def _ceil_to_next_hour(ts: float) -> int:
+    dt = datetime.utcfromtimestamp(ts)
+    if dt.minute == 0 and dt.second == 0:
+        return int(ts)
+    dt = dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    return int(dt.timestamp())
+
+
+def _cleanup_worker():
+    global firewall
+    app.logger.info("[cleanup] Temp whitelist cleanup worker started")
+    while True:
+        try:
+            now_ts = int(time.time())
+            expired = settings.get_expired_temp_whitelist(now_ts)
+            if expired:
+                fw = get_firewall()
+                if fw is None:
+                    app.logger.warning("[cleanup] PVE not configured; will retry later")
+                else:
+                    for row in expired:
+                        try:
+                            fw.remove_ip_from_ipset("temp", row.cidr)
+                        except Exception as e:
+                            # Ignore deletion errors; still remove record to avoid leak
+                            app.logger.warning(f"[cleanup] remove {row.cidr} failed: {e}")
+                        finally:
+                            try:
+                                settings.delete_temp_whitelist(row.cidr)
+                            except Exception:
+                                pass
+            # sleep until next hour boundary to keep 1h granularity
+            now = time.time()
+            next_hour = _ceil_to_next_hour(now)
+            time.sleep(max(30, next_hour - now))
+        except Exception as e:  # keep worker alive
+            app.logger.error(f"[cleanup] worker error: {e}")
+            time.sleep(60)
+
+
+def _ensure_cleanup_thread():
+    global _cleanup_thread_started
+    with _cleanup_lock:
+        if not _cleanup_thread_started:
+            t = threading.Thread(target=_cleanup_worker, daemon=True)
+            t.start()
+            _cleanup_thread_started = True
+
+
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -175,6 +230,7 @@ def logout():
 def dashboard():
     # Avoid touching Proxmox on dashboard; only check settings.
     unconfigured = not bool((settings.pve.get("host") or "").strip())
+    _ensure_cleanup_thread()
     return render_template("dashboard.html", unconfigured=unconfigured)
 
 
@@ -213,6 +269,175 @@ def ipsets_index():
                 message = "已删除"
     ipsets = fw.get_ipsets()
     return render_template("ipsets.html", ipsets=ipsets, message=message)
+
+
+@app.route("/temp-whitelist", methods=["GET"])
+@login_required
+def temp_whitelist_page():
+    _ensure_cleanup_thread()
+    return render_template("temp_whitelist.html")
+
+
+@app.route("/api/temp_whitelist", methods=["POST"])
+@login_required
+def api_temp_whitelist():
+    _ensure_cleanup_thread()
+    data = request.get_json(silent=True) or {}
+    ip = (data.get("ip") or "").strip()
+    days = int(data.get("ttl_days") or 1)
+    hostname = (data.get("hostname") or "").strip() or None
+    if days not in (1, 7, 14):
+        return jsonify({"ok": False, "message": "ttl_days must be 1/7/14"}), 400
+    if not ip:
+        return jsonify({"ok": False, "message": "missing ip"}), 400
+    try:
+        network = ip_network(ip, strict=False)
+    except Exception:
+        return jsonify({"ok": False, "message": "invalid ip"}), 400
+
+    fw = get_firewall()
+    if fw is None:
+        return jsonify({"ok": False, "message": "PVE 未配置，请先到设置页面配置。"}), 400
+
+    # ensure temp ipset exists
+    try:
+        names = [i.get("name") for i in fw.get_ipsets()]
+        if "temp" not in names:
+            fw.create_ipset("temp", comment="Temporary whitelist")
+    except Exception:
+        pass
+
+    # add if not present
+    existing = set(fw.check_ipset("temp"))
+    if str(network) not in existing:
+        fw.add_ip_to_ipset("temp", network)
+
+    now = time.time()
+    expires = _ceil_to_next_hour(now + days * 24 * 3600)
+    settings.add_or_update_temp_whitelist(str(network), int(expires), hostname=hostname)
+
+    return jsonify({
+        "ok": True,
+        "message": "added to temp ipset",
+        "cidr": str(network),
+        "expires_at": datetime.utcfromtimestamp(int(expires)).isoformat() + "Z",
+    })
+
+
+@app.route("/api/temp_whitelist", methods=["GET"])
+@login_required
+def api_temp_whitelist_list():
+    now_ts = int(time.time())
+    rows = settings.list_temp_whitelist(include_expired=False)
+    present_set: set[str] = set()
+    try:
+        fw = get_firewall()
+        if fw is not None:
+            present_set = set(fw.check_ipset("temp"))
+    except Exception:
+        pass
+    result = []
+    for r in rows:
+        result.append({
+            "cidr": r.cidr,
+            "hostname": r.hostname or "",
+            "created_at": r.created_at,
+            "expires_at": r.expires_at,
+            "present": r.cidr in present_set,
+        })
+    return jsonify({"ok": True, "items": result, "now": now_ts})
+
+
+@app.route("/api/temp_whitelist", methods=["DELETE"])
+@login_required
+def api_temp_whitelist_delete():
+    data = request.get_json(silent=True) or {}
+    cidr = (data.get("cidr") or "").strip()
+    if not cidr:
+        return jsonify({"ok": False, "message": "missing cidr"}), 400
+    try:
+        fw = get_firewall()
+        if fw is not None:
+            try:
+                fw.remove_ip_from_ipset("temp", cidr)
+            except Exception:
+                pass
+        settings.delete_temp_whitelist(cidr)
+        return jsonify({"ok": True, "message": "deleted", "cidr": cidr})
+    except Exception as e:
+        return jsonify({"ok": False, "message": str(e)}), 200
+
+
+@app.route("/api/temp_whitelist/extend", methods=["POST"])
+@login_required
+def api_temp_whitelist_extend():
+    data = request.get_json(silent=True) or {}
+    cidr = (data.get("cidr") or "").strip()
+    days = int(data.get("ttl_days") or 1)
+    if days not in (1, 7, 14):
+        return jsonify({"ok": False, "message": "ttl_days must be 1/7/14"}), 400
+    if not cidr:
+        return jsonify({"ok": False, "message": "missing cidr"}), 400
+    try:
+        now = time.time()
+        expires = _ceil_to_next_hour(now + days * 24 * 3600)
+        settings.add_or_update_temp_whitelist(cidr, int(expires))
+        return jsonify({
+            "ok": True,
+            "message": "extended",
+            "cidr": cidr,
+            "expires_at": datetime.utcfromtimestamp(int(expires)).isoformat() + "Z",
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "message": str(e)}), 200
+
+
+@app.route("/api/temp_whitelist/set_expiry", methods=["POST"])
+@login_required
+def api_temp_whitelist_set_expiry():
+    data = request.get_json(silent=True) or {}
+    cidr = (data.get("cidr") or "").strip()
+    expires_at = data.get("expires_at")
+    if not cidr:
+        return jsonify({"ok": False, "message": "missing cidr"}), 400
+    if expires_at is None:
+        return jsonify({"ok": False, "message": "missing expires_at"}), 400
+    try:
+        # supports epoch seconds or ISO string
+        if isinstance(expires_at, (int, float)):
+            target = float(expires_at)
+        else:
+            # try parse ISO
+            try:
+                target = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00")).timestamp()
+            except Exception:
+                return jsonify({"ok": False, "message": "invalid expires_at"}), 400
+        target = max(target, time.time())  # not in the past
+        expires = _ceil_to_next_hour(target)
+        settings.add_or_update_temp_whitelist(cidr, int(expires))
+        return jsonify({
+            "ok": True,
+            "message": "expiry set",
+            "cidr": cidr,
+            "expires_at": datetime.utcfromtimestamp(int(expires)).isoformat() + "Z",
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "message": str(e)}), 200
+
+
+@app.route("/api/temp_whitelist/hostname", methods=["POST"])
+@login_required
+def api_temp_whitelist_hostname():
+    data = request.get_json(silent=True) or {}
+    cidr = (data.get("cidr") or "").strip()
+    hostname = (data.get("hostname") or "").strip() or None
+    if not cidr:
+        return jsonify({"ok": False, "message": "missing cidr"}), 400
+    try:
+        settings.update_temp_hostname(cidr, hostname)
+        return jsonify({"ok": True, "message": "hostname updated", "cidr": cidr, "hostname": hostname or ""})
+    except Exception as e:
+        return jsonify({"ok": False, "message": str(e)}), 200
 
 
 @app.route("/ipsets/<name>", methods=["GET", "POST"])

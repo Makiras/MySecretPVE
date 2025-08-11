@@ -28,5 +28,14 @@
       </div>
     </div>
   </div>
+  <div class="col-md-4 mb-3">
+    <div class="card h-100">
+      <div class="card-body d-flex flex-column">
+        <h5 class="card-title">Temporary Whitelist</h5>
+        <p class="card-text">Detect your IP in browser and add to IPSet <code>temp</code> with TTL.</p>
+        <a href="{{ url_for('temp_whitelist_page') }}" class="mt-auto btn btn-primary">Open</a>
+      </div>
+    </div>
+  </div>
 </div>
 {% endblock %}
