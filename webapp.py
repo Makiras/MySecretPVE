@@ -15,6 +15,7 @@ from flask import (
     jsonify,
 )
 from proxmoxer import ProxmoxAPI
+import requests
 
 from config import (
     WEB_USERNAME,
@@ -25,6 +26,9 @@ from config import (
 )
 from modules.firewall import Firewall
 from modules.settings import Settings
+from modules.edgeone import EdgeOne
+from modules.cloudflare import Cloudflare
+from modules.tencent import Tencent
 from datetime import datetime, timedelta
 import threading
 import time
@@ -36,6 +40,8 @@ app.secret_key = FLASK_SECRET_KEY
 settings = Settings()
 _cleanup_thread_started = False
 _cleanup_lock = threading.Lock()
+_cdn_thread_started = False
+_cdn_lock = threading.Lock()
 
 def setup_request_logging():
     """Enable verbose logging for proxmoxer and HTTP requests.
@@ -196,6 +202,88 @@ def _ensure_cleanup_thread():
             _cleanup_thread_started = True
 
 
+def _cdn_sync_once(app_logger=None):
+    log = app_logger or app.logger
+    conf = settings.cdn
+    if not conf.get("enabled"):
+        return
+    fw = get_firewall()
+    if fw is None:
+        log.warning("[cdn-sync] PVE not configured; skip")
+        return
+    results = []
+    try:
+        eo = EdgeOne()
+        eo_ranges = eo.get_cdn_iprange(isv6=False) + eo.get_cdn_iprange(isv6=True)
+        names = [i.get("name") for i in fw.get_ipsets()]
+        if conf["ipset_edgeone"] not in names:
+            fw.create_ipset(conf["ipset_edgeone"], comment="EdgeOne back-to-origin")
+        fw.update_ipset(conf["ipset_edgeone"], eo_ranges)
+        results.append(("edgeone", len(eo_ranges)))
+        settings.set_cdn_sync_status("edgeone", True, len(eo_ranges), "ok")
+    except Exception as e:
+        log.warning(f"[cdn-sync] edgeone failed: {e}")
+        settings.set_cdn_sync_status("edgeone", False, 0, f"{type(e).__name__}: {e}")
+    try:
+        cf = Cloudflare()
+        cf_ranges = cf.get_cdn_iprange(isv6=False) + cf.get_cdn_iprange(isv6=True)
+        names = [i.get("name") for i in fw.get_ipsets()]
+        if conf["ipset_cloudflare"] not in names:
+            fw.create_ipset(conf["ipset_cloudflare"], comment="Cloudflare back-to-origin")
+        fw.update_ipset(conf["ipset_cloudflare"], cf_ranges)
+        results.append(("cloudflare", len(cf_ranges)))
+        settings.set_cdn_sync_status("cloudflare", True, len(cf_ranges), "ok")
+    except Exception as e:
+        log.warning(f"[cdn-sync] cloudflare failed: {e}")
+        settings.set_cdn_sync_status("cloudflare", False, 0, f"{type(e).__name__}: {e}")
+    try:
+        t_conf = settings.tencent
+        secret = (t_conf.get("secret") or "").strip()
+        key = (t_conf.get("key") or "").strip()
+        if secret and key:
+            tc = Tencent(secret, key)
+            t_ranges = tc.get_cdn_iprange(isv6=False) + tc.get_cdn_iprange(isv6=True)
+            names = [i.get("name") for i in fw.get_ipsets()]
+            if conf["ipset_tencent"] not in names:
+                fw.create_ipset(conf["ipset_tencent"], comment="Tencent CDN back-to-origin")
+            fw.update_ipset(conf["ipset_tencent"], t_ranges)
+            results.append(("tencent", len(t_ranges)))
+            settings.set_cdn_sync_status("tencent", True, len(t_ranges), "ok")
+        else:
+            log.info("[cdn-sync] tencent credentials missing; skip")
+            settings.set_cdn_sync_status("tencent", False, 0, "missing credentials")
+    except Exception as e:
+        log.warning(f"[cdn-sync] tencent failed: {e}")
+        settings.set_cdn_sync_status("tencent", False, 0, f"{type(e).__name__}: {e}")
+    if results:
+        log.info("[cdn-sync] synced: " + ", ".join(f"{n}:{c}" for n, c in results))
+
+
+def _cdn_worker():
+    app.logger.info("[cdn-sync] scheduler started")
+    while True:
+        try:
+            conf = settings.cdn
+            if conf.get("enabled"):
+                _cdn_sync_once(app_logger=app.logger)
+                interval = int(conf.get("interval_minutes") or 360)
+                time.sleep(max(60, interval * 60))
+            else:
+                time.sleep(60)
+        except Exception as e:
+            app.logger.warning(f"[cdn-sync] worker error: {e}")
+            time.sleep(60)
+
+
+def _ensure_cdn_thread():
+    global _cdn_thread_started
+    with _cdn_lock:
+        if not _cdn_thread_started:
+            t = threading.Thread(target=_cdn_worker, daemon=True)
+            t.start()
+            _cdn_thread_started = True
+
+
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -231,6 +319,7 @@ def dashboard():
     # Avoid touching Proxmox on dashboard; only check settings.
     unconfigured = not bool((settings.pve.get("host") or "").strip())
     _ensure_cleanup_thread()
+    _ensure_cdn_thread()
     return render_template("dashboard.html", unconfigured=unconfigured)
 
 
@@ -583,6 +672,159 @@ def settings_tencent():
     return render_template(
         "settings_tencent.html", settings=settings.tencent, message=message
     )
+
+
+@app.route("/settings/cdn", methods=["GET", "POST"])
+@login_required
+def settings_cdn():
+    message = None
+    if request.method == "POST":
+        action = request.form.get("action")
+        if action == "save_cdn":
+            enabled = request.form.get("enabled") == "on"
+            interval = int(request.form.get("interval_minutes") or 360)
+            ip_edgeone = (request.form.get("ipset_edgeone") or "edgeone").strip()
+            ip_cf = (request.form.get("ipset_cloudflare") or "cloudflare").strip()
+            ip_tencent = (request.form.get("ipset_tencent") or "tencent").strip()
+            settings.update_cdn(
+                enabled=enabled,
+                interval_minutes=max(1, interval),
+                ipset_edgeone=ip_edgeone,
+                ipset_cloudflare=ip_cf,
+                ipset_tencent=ip_tencent,
+            )
+            message = "CDN settings updated"
+        elif action == "save_tencent":
+            secret = request.form.get("secret", "")
+            key = request.form.get("key", "")
+            settings.update_tencent(secret, key)
+            message = "Tencent credentials updated"
+    _ensure_cdn_thread()
+    # build status with formatted time
+    statuses = settings.get_cdn_sync_status()
+    for k, v in statuses.items():
+        ts = int(v.get("last_ts") or 0)
+        v["last_time_text"] = (datetime.utcfromtimestamp(ts).isoformat() + "Z") if ts > 0 else "-"
+    return render_template(
+        "settings_cdn.html",
+        cdn=settings.cdn,
+        tencent=settings.tencent,
+        statuses=statuses,
+        message=message,
+    )
+
+
+@app.route("/api/cdn/sync", methods=["POST"])
+@login_required
+def api_cdn_sync():
+    data = request.get_json(silent=True) or {}
+    provider = (data.get("provider") or "").strip().lower()
+    if provider not in ("edgeone", "cloudflare", "tencent"):
+        return jsonify({"ok": False, "message": "unknown provider"}), 400
+    fw = get_firewall()
+    if fw is None:
+        return jsonify({"ok": False, "message": "PVE 未配置，请先到设置页面配置。"}), 400
+    conf = settings.cdn
+    # Step 1: fetch provider ranges with detailed error
+    try:
+        if provider == "edgeone":
+            eo = EdgeOne()
+            ranges = eo.get_cdn_iprange(False) + eo.get_cdn_iprange(True)
+            name = conf["ipset_edgeone"]
+        elif provider == "cloudflare":
+            cf = Cloudflare()
+            ranges = cf.get_cdn_iprange(False) + cf.get_cdn_iprange(True)
+            name = conf["ipset_cloudflare"]
+        else:
+            t_conf = settings.tencent
+            secret = (t_conf.get("secret") or "").strip()
+            key = (t_conf.get("key") or "").strip()
+            if not (secret and key):
+                return jsonify({"ok": False, "message": "请先配置腾讯云密钥"}), 400
+            tc = Tencent(secret, key)
+            ranges = tc.get_cdn_iprange(False) + tc.get_cdn_iprange(True)
+            name = conf["ipset_tencent"]
+    except Exception as e:
+        msg = f"获取 {provider} IP 段失败: {type(e).__name__}: {e}"
+        settings.set_cdn_sync_status(provider, False, 0, msg)
+        return jsonify({"ok": False, "message": msg}), 200
+
+    # Step 2: apply to PVE firewall (return PVE-specific error if occurs)
+    try:
+        names = [i.get("name") for i in fw.get_ipsets()]
+    except Exception as e:
+        msg = f"PVE 列取 IPSet 失败: {type(e).__name__}: {e}"
+        settings.set_cdn_sync_status(provider, False, 0, msg)
+        return jsonify({"ok": False, "message": msg}), 200
+    try:
+        if name not in names:
+            fw.create_ipset(name, comment=f"{provider} back-to-origin")
+    except Exception as e:
+        msg = f"PVE 创建 IPSet 失败: {type(e).__name__}: {e}"
+        settings.set_cdn_sync_status(provider, False, 0, msg)
+        return jsonify({"ok": False, "message": msg}), 200
+    try:
+        fw.update_ipset(name, ranges)
+    except Exception as e:
+        msg = f"PVE 更新 IPSet 失败: {type(e).__name__}: {e}"
+        settings.set_cdn_sync_status(provider, False, 0, msg)
+        return jsonify({"ok": False, "message": msg}), 200
+    settings.set_cdn_sync_status(provider, True, len(ranges), "ok")
+    return jsonify({"ok": True, "message": f"synced {provider}", "count": len(ranges), "ipset": name})
+
+
+@app.route("/api/cdn/sync_all", methods=["POST"])
+@login_required
+def api_cdn_sync_all():
+    fw = get_firewall()
+    if fw is None:
+        return jsonify({"ok": False, "message": "PVE 未配置，请先到设置页面配置。"}), 400
+    providers = ["edgeone", "cloudflare", "tencent"]
+    results = []
+    all_ok = True
+    for p in providers:
+        # reuse api_cdn_sync logic inline
+        try:
+            if p == "edgeone":
+                eo = EdgeOne()
+                ranges = eo.get_cdn_iprange(False) + eo.get_cdn_iprange(True)
+                name = settings.cdn["ipset_edgeone"]
+            elif p == "cloudflare":
+                cf = Cloudflare()
+                ranges = cf.get_cdn_iprange(False) + cf.get_cdn_iprange(True)
+                name = settings.cdn["ipset_cloudflare"]
+            else:
+                t_conf = settings.tencent
+                secret = (t_conf.get("secret") or "").strip()
+                key = (t_conf.get("key") or "").strip()
+                if not (secret and key):
+                    msg = "请先配置腾讯云密钥"
+                    settings.set_cdn_sync_status(p, False, 0, msg)
+                    results.append({"provider": p, "ok": False, "message": msg})
+                    all_ok = False
+                    continue
+                tc = Tencent(secret, key)
+                ranges = tc.get_cdn_iprange(False) + tc.get_cdn_iprange(True)
+                name = settings.cdn["ipset_tencent"]
+        except Exception as e:
+            msg = f"获取 {p} IP 段失败: {type(e).__name__}: {e}"
+            settings.set_cdn_sync_status(p, False, 0, msg)
+            results.append({"provider": p, "ok": False, "message": msg})
+            all_ok = False
+            continue
+        try:
+            names = [i.get("name") for i in fw.get_ipsets()]
+            if name not in names:
+                fw.create_ipset(name, comment=f"{p} back-to-origin")
+            fw.update_ipset(name, ranges)
+            settings.set_cdn_sync_status(p, True, len(ranges), "ok")
+            results.append({"provider": p, "ok": True, "count": len(ranges), "ipset": name})
+        except Exception as e:
+            msg = f"PVE 更新 IPSet 失败: {type(e).__name__}: {e}"
+            settings.set_cdn_sync_status(p, False, 0, msg)
+            results.append({"provider": p, "ok": False, "message": msg})
+            all_ok = False
+    return jsonify({"ok": all_ok, "items": results})
 
 
 # 入口在 main.py 中统一启动

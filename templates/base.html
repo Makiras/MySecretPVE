@@ -17,7 +17,7 @@
           <ul class="navbar-nav me-auto">
             {% if session.get('logged_in') %}
             <li class="nav-item"><a class="nav-link" href="{{ url_for('settings_pve') }}">PVE</a></li>
-            <li class="nav-item"><a class="nav-link" href="{{ url_for('settings_tencent') }}">Tencent</a></li>
+            <li class="nav-item"><a class="nav-link" href="{{ url_for('settings_cdn') }}">CDN</a></li>
             <li class="nav-item"><a class="nav-link" href="{{ url_for('ipsets_index') }}">Firewall</a></li>
             <li class="nav-item"><a class="nav-link" href="{{ url_for('temp_whitelist_page') }}">Temp Whitelist</a></li>
             {% endif %}

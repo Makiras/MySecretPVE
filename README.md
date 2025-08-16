@@ -97,6 +97,7 @@ gunicorn -w 2 -b 0.0.0.0:5000 webapp:app
 │   ├── firewall.py       # 基于 proxmoxer 的防火墙/IPSet 封装
 │   ├── settings.py       # SQLAlchemy 模型与 Settings 持久化
 │   ├── cloudflare.py     # Cloudflare IP 段获取（后续可接入）
+│   ├── edgeone.py        # 腾讯云 EdgeOne 回源 IP 段获取
 │   ├── tencent.py        # 腾讯云 CDN / 域名操作封装（扩展用）
 │   └── ipranger.py       # 获取公网 IPv4/IPv6（扩展/工具）
 ├── templates/            # Jinja2 模板（登录/仪表盘/IPSet/设置等）

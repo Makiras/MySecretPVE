@@ -34,6 +34,30 @@ class TencentConfig(Base):
     secret = Column(String, nullable=False)
     key = Column(String, nullable=False)
 
+# 定义 CDN 配置模型
+class CDNConfig(Base):
+    __tablename__ = "cdn_config"
+
+    id = Column(String, primary_key=True, index=True, default="default")
+    # 是否启用定时同步
+    enabled = Column(Boolean, default=False)
+    # 同步周期（分钟）
+    interval_minutes = Column(Integer, default=360)
+    # 各提供商对应的 IPSet 名称
+    ipset_edgeone = Column(String, nullable=False, default="edgeone")
+    ipset_cloudflare = Column(String, nullable=False, default="cloudflare")
+    ipset_tencent = Column(String, nullable=False, default="tencent")
+
+    
+class CDNSyncStatus(Base):
+    __tablename__ = "cdn_sync_status"
+
+    provider = Column(String, primary_key=True, index=True)
+    last_ts = Column(BigInteger, nullable=False, default=0)
+    last_ok = Column(Boolean, default=False)
+    last_count = Column(Integer, default=0)
+    last_message = Column(String, nullable=True)
+
 # 修改 Settings 类（基于数据库持久化）
 class Settings:
     """Persistent settings using SQLite (SQLAlchemy)."""
@@ -56,6 +80,27 @@ class Settings:
             cols_tw = {r[1] for r in conn.exec_driver_sql("PRAGMA table_info('temp_whitelist')").fetchall()}
             if "hostname" not in cols_tw:
                 conn.exec_driver_sql("ALTER TABLE temp_whitelist ADD COLUMN hostname VARCHAR")
+            # Ensure cdn_config table exists
+            conn.exec_driver_sql(
+                "CREATE TABLE IF NOT EXISTS cdn_config ("
+                "id VARCHAR PRIMARY KEY, "
+                "enabled BOOLEAN DEFAULT 0, "
+                "interval_minutes INTEGER DEFAULT 360, "
+                "ipset_edgeone VARCHAR NOT NULL DEFAULT 'edgeone', "
+                "ipset_cloudflare VARCHAR NOT NULL DEFAULT 'cloudflare', "
+                "ipset_tencent VARCHAR NOT NULL DEFAULT 'tencent'"
+                ")"
+            )
+            # Ensure cdn_sync_status table exists
+            conn.exec_driver_sql(
+                "CREATE TABLE IF NOT EXISTS cdn_sync_status ("
+                "provider VARCHAR PRIMARY KEY, "
+                "last_ts BIGINT NOT NULL DEFAULT 0, "
+                "last_ok BOOLEAN DEFAULT 0, "
+                "last_count INTEGER DEFAULT 0, "
+                "last_message VARCHAR"
+                ")"
+            )
         self.db = SessionLocal()
 
     # 归一化 PVE Host：剥离协议与端口，自动识别重复输入
@@ -149,6 +194,37 @@ class Settings:
             config.token_name = (token_name or None)
             config.token_value = (token_value or None)
         self.db.commit()
+    
+    # CDN sync status helpers
+    def set_cdn_sync_status(self, provider: str, ok: bool, count: int, message: str | None = None, ts: int | None = None) -> None:
+        if ts is None:
+            ts = int(datetime.utcnow().timestamp())
+        row = self.db.query(CDNSyncStatus).filter_by(provider=provider).first()
+        if not row:
+            row = CDNSyncStatus(provider=provider, last_ts=ts, last_ok=ok, last_count=count, last_message=message)
+            self.db.add(row)
+        else:
+            row.last_ts = ts
+            row.last_ok = ok
+            row.last_count = count
+            row.last_message = message
+        self.db.commit()
+
+    def get_cdn_sync_status(self) -> dict:
+        rows = self.db.query(CDNSyncStatus).all()
+        res = {}
+        for r in rows:
+            res[r.provider] = {
+                "last_ts": int(r.last_ts or 0),
+                "last_ok": bool(r.last_ok),
+                "last_count": int(r.last_count or 0),
+                "last_message": r.last_message or "",
+            }
+        # ensure placeholders for known providers
+        for key in ("edgeone", "cloudflare", "tencent"):
+            if key not in res:
+                res[key] = {"last_ts": 0, "last_ok": False, "last_count": 0, "last_message": ""}
+        return res
 
     # 临时白名单表：记录 CIDR 与过期时间
     class TempWhitelist(Base):
@@ -225,4 +301,46 @@ class Settings:
         else:
             config.secret = secret
             config.key = key
+        self.db.commit()
+
+    @property
+    def cdn(self):
+        config = self.db.query(CDNConfig).filter_by(id="default").first()
+        if not config:
+            config = CDNConfig(
+                id="default",
+                enabled=False,
+                interval_minutes=360,
+                ipset_edgeone="edgeone",
+                ipset_cloudflare="cloudflare",
+                ipset_tencent="tencent",
+            )
+            self.db.add(config)
+            self.db.commit()
+        return {
+            "enabled": bool(config.enabled),
+            "interval_minutes": int(config.interval_minutes or 360),
+            "ipset_edgeone": config.ipset_edgeone or "edgeone",
+            "ipset_cloudflare": config.ipset_cloudflare or "cloudflare",
+            "ipset_tencent": config.ipset_tencent or "tencent",
+        }
+
+    def update_cdn(self, *, enabled: bool, interval_minutes: int, ipset_edgeone: str, ipset_cloudflare: str, ipset_tencent: str) -> None:
+        config = self.db.query(CDNConfig).filter_by(id="default").first()
+        if not config:
+            config = CDNConfig(
+                id="default",
+                enabled=enabled,
+                interval_minutes=interval_minutes,
+                ipset_edgeone=ipset_edgeone,
+                ipset_cloudflare=ipset_cloudflare,
+                ipset_tencent=ipset_tencent,
+            )
+            self.db.add(config)
+        else:
+            config.enabled = enabled
+            config.interval_minutes = interval_minutes
+            config.ipset_edgeone = ipset_edgeone
+            config.ipset_cloudflare = ipset_cloudflare
+            config.ipset_tencent = ipset_tencent
         self.db.commit()
